@@ -102,7 +102,7 @@ An isolated check showed that the installed TorchTPU BatchNorm implementation us
 
 After each epoch, the runner computes validation AUROC from the continuous softmax probability for the positive class. The checkpoint with the highest validation AUROC is retained. Once the 20 epochs finish, that checkpoint and its validation predictions are saved. The selected checkpoint is then evaluated on test once. Test AUROC is computed with `sklearn.metrics.roc_auc_score` from continuous positive-class probabilities; no threshold is selected or applied.
 
-The original planned protocol was ten seeds per task followed by top-five test evaluation. The user subsequently requested one result per task, so the full multi-seed job was stopped during Pleural Effusion seed 44 at epoch 12. That partial seed did not produce a completed checkpoint and is excluded. Pleural Effusion seed 43 was reused as it had the highest validation AUROC among the two completed Pleural Effusion seeds (42 and 43). Cardiomegaly seed 43 was the only seed trained for that task. This does not implement the paper's ten-seed/top-five summary protocol.
+The original planned protocol was ten seeds per task followed by top-five test evaluation. The local artifacts contain complete 20-epoch Pleural Effusion histories and checkpoints for seeds 42, 43, and 44; seed 43 has the highest validation AUROC of those three and is the only Pleural Effusion seed included in the final test-evaluated summary. Cardiomegaly seed 43 was the only seed trained for that task. The remaining multi-seed schedule was not completed, so this does not implement the paper's ten-seed/top-five summary protocol.
 
 ## 5. Results
 
@@ -146,6 +146,46 @@ The table reports mean training cross-entropy over the examples used in each epo
 
 For context, the reference paper reports CheXpert ResNet baseline results of 93.04 ± 0.88 AUROC for No Finding versus Pleural Effusion and 89.24 ± 1.07 for No Finding versus Cardiomegaly in Table 1 [1]. Those are top-five-of-ten summaries; our values are single-seed test AUROCs. Given the different loss/head, Hugging Face image bytes, the TPU BatchNorm workaround, and the one-seed scope, the numerical difference should not be interpreted as evidence that one approach is superior.
 
+### 5.4 External TorchXRayVision DenseNet-121 comparison
+
+We also evaluated the pretrained TorchXRayVision DenseNet-121 `densenet121-res224-mimic_ch` checkpoint on the same CheXpert test cohorts. This checkpoint is trained on MIMIC-CXR with CheXpert-labeler targets; its output pathology `Effusion` was mapped to Pleural Effusion, while `Cardiomegaly` maps directly. TorchXRayVision documents this as its 224 × 224 MIMIC-CXR model [5]. We selected MIMIC-CXR pretraining to make this an external-pretraining baseline and avoid the possible test-set overlap associated with a CheXpert-trained checkpoint.
+
+| Task | Examples | ResNet-18 CheXpert seed 43 | XRV DenseNet-121 MIMIC-CXR | XRV minus ResNet-18 |
+|---|---:|---:|---:|---:|
+| No Finding vs Pleural Effusion | 18,826 | 0.9476 | 0.8892 | -0.0584 |
+| No Finding vs Cardiomegaly | 8,205 | 0.9377 | 0.8917 | -0.0460 |
+
+Both models were scored on the same project test CSV and the same task-specific binary cohort filters. For TorchXRayVision, grayscale pixels were normalized from 8-bit values to its expected `[-1024, 1024]` range; the stored images were already square 224 × 224, so no further crop or resize was needed. The ResNet-18 input path instead uses the repository's pseudo-RGB images without this intensity normalization. The comparison therefore measures each model under its expected input scaling; it does not isolate the architecture effect.
+
+The TorchXRayVision model ran in TorchTPU compiled mode with bfloat16 autocast and batch size 64. Its output operating-point calibration was disabled and raw pathology logits were used. The calibration applies a monotonic transformation per output, which preserves AUROC rankings; no threshold was selected on this test set. The evaluator, configuration (including the XRV weight SHA-256), and per-example scores are saved under the ignored local path `chexpert/runs/resnet18_baseline_tpu_ce/torchxrayvision_densenet121_mimic_ch/`. Reproduce it with TorchXRayVision 1.5.7 installed and:
+
+```bash
+python -m pip install torchxrayvision==1.5.7
+env \
+  PYTHONPATH="$PWD" \
+  CXR_DEVICE=tpu \
+  CXR_TPU_AMP=1 \
+  CXR_TPU_COMPILE=1 \
+  CXR_NUM_WORKERS=4 \
+  CXR_EVAL_BATCH_SIZE=64 \
+  python scripts/evaluate_torchxrayvision_chexpert.py
+```
+
+On these test cohorts, the fine-tuned ResNet-18 scored 0.0584 AUROC higher for Pleural Effusion and 0.0460 higher for Cardiomegaly than this external pretrained DenseNet-121. These are descriptive differences between two differently pretrained and differently processed models, without confidence intervals or a multi-seed analysis; they should not be attributed to architecture alone.
+
+### 5.5 TorchXRayVision DenseNet-121 pretrained on CheXpert
+
+At the user's request, we also evaluated TorchXRayVision's `densenet121-res224-chex` checkpoint, whose documented training source is CheXpert. Evaluation used the same held-out project CSVs, binary cohort filters, TorchTPU compiled execution, bfloat16 autocast, and batch size 64 as the MIMIC-CXR-pretrained comparison. This is a higher-overlap-risk comparison: the checkpoint may have trained on some or all images in our test cohorts. TorchXRayVision's precise training image list and split were not available for verifying overlap, so treat these scores as exploratory and potentially non-independent; they are not an unbiased test-set comparison.
+
+| Task | Examples | ResNet-18 CheXpert seed 43 | XRV DenseNet-121 CheXpert | XRV minus ResNet-18 |
+|---|---:|---:|---:|---:|
+| No Finding vs Pleural Effusion | 18,826 | 0.9476 | 0.9320 | -0.0156 |
+| No Finding vs Cardiomegaly | 8,205 | 0.9377 | 0.9330 | -0.0047 |
+
+The XRV model used its expected grayscale normalization to `[-1024, 1024]`; inputs were already 224 × 224. Raw pathology logits were used for AUROC, with XRV sigmoid/operating-point calibration disabled because the per-output monotonic transform does not change score ranking. Weight identifier: `densenet121-res224-chex`; SHA-256: `1a914ae802170187a4852e594708206c12468eeeefd66aa4e8e26141649d61a4`. The evaluator, configuration, and per-example predictions are in the ignored local directory `chexpert/runs/resnet18_baseline_tpu_ce/torchxrayvision_densenet121_chex/`.
+
+Both AUROCs are below the corresponding ResNet-18 values, by 0.0156 and 0.0047. Because the pretrained checkpoint may have seen test images and differs in training data, architecture, and preprocessing, these differences are descriptive only and do not establish comparative generalization. The evaluation metrics and prediction files were written successfully; the process then encountered a segmentation fault during compiled TorchTPU executable cleanup.
+
 ## 6. Reproducibility and artifacts
 
 The runner is [`chexpert/run_resnet18_baseline.py`](../chexpert/run_resnet18_baseline.py). The preprocessing code and broader protocol notes are [`chexpert/prepare_hf_baseline.py`](../chexpert/prepare_hf_baseline.py) and [`docs/chexpert-table1-training-plan.md`](chexpert-table1-training-plan.md). The run used:
@@ -182,3 +222,4 @@ Accordingly, report the two test AUROCs as **single-seed adapted-reproduction re
 2. Hugging Face dataset repository, `danjacobellis/chexpert`. [https://huggingface.co/datasets/danjacobellis/chexpert](https://huggingface.co/datasets/danjacobellis/chexpert).
 3. Google PyTorch TorchTPU issue tracker, “BatchNorm never updates running_mean/running_var in training mode.” [https://github.com/google-pytorch/torch_tpu/issues/6465](https://github.com/google-pytorch/torch_tpu/issues/6465).
 4. TorchTPU API reference, automatic mixed precision. [https://torchtpu.readthedocs.io/en/latest/api_reference/](https://torchtpu.readthedocs.io/en/latest/api_reference/).
+5. TorchXRayVision, model definitions and pretrained weights, including `densenet121-res224-mimic_ch`. [https://github.com/mlmed/torchxrayvision/blob/main/torchxrayvision/models.py](https://github.com/mlmed/torchxrayvision/blob/main/torchxrayvision/models.py).

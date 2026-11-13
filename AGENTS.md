@@ -2,14 +2,13 @@
 
 ## Project Structure
 
-- `prediction/` contains model, dataset, metric, and training implementations. CXR loaders are in `prediction/datasets/`.
-- `datafiles/` contains dataset setup utilities and small metadata/configuration files; do not commit private datasets.
-- `scripts/` contains shell launchers and experiment entry points. `notebooks/` holds exploratory workflows, and `docs/` records replication and experiment procedures.
-- CheXpert-specific baseline scripts and runtime outputs live under `chexpert/`; large images, caches, checkpoints, and generated results should remain local.
+- `prediction/` contains models, metrics, training, and CXR loaders; data utilities are in `datafiles/`.
+- `scripts/` contains experiment entry points, `notebooks/` exploratory work, and `docs/` replication guides and reports.
+- `chexpert/` holds CheXpert-specific scripts and ignored runtime outputs. Keep images, caches, checkpoints, and generated results local.
 
 ## Environment and Common Commands
 
-The main environment is specified by `pyproject.toml` and `poetry.lock` (Python 3.12, PyTorch 2.4.1). Install it with `poetry install`. Useful entry points include:
+The general environment is pinned in `pyproject.toml` and `poetry.lock` (Python 3.12, PyTorch 2.4.1). Install and inspect entry points with:
 
 ```bash
 poetry run race_invariance --help
@@ -17,20 +16,26 @@ poetry run view_invariance --help
 python scripts/run_chexpert_table1.py --help
 ```
 
-For the TPU-specific CheXpert workflow, follow `docs/resnet18-chexpert-tpu-runbook.md` and use `environment-torchtpu.yml`; its dependencies differ from the Poetry environment. Shell scripts may encode cluster-specific paths and arguments, so inspect and adapt them before launching jobs.
+For TPU CheXpert runs, use `environment-torchtpu.yml` and follow `docs/resnet18-chexpert-tpu-runbook.md`; this environment differs from Poetry. Review cluster-specific shell scripts before use.
+
+## TorchXRayVision TPU Inference
+
+- Compile fixed-shape inference with `torch.compile(model, backend="tpu", dynamic=False)`. The first call compiles; benchmark later calls with the same shape. On this host, eager batch-32 was about 5 images/s; compiled batch-64 evaluated roughly 27k examples in about a minute.
+- Benchmark batch sizes. Pad the final partial batch and trim its padded scores to avoid compiling another shape. Apply XRV's grayscale normalization to `[-1024, 1024]`; skip crop/resize only when inputs are already square 224 × 224.
+- XRV operating-point calibration uses indexed assignment unsupported by this TorchTPU compiler. For AUROC, raw logits preserve ranking; keep calibration for threshold-based metrics.
 
 ## Coding Style
 
-Follow the existing Python style: four-space indentation, `snake_case` for modules/functions/variables, and `PascalCase` for classes. Keep experiment parameters explicit and log seeds, data splits, preprocessing, device, and checkpoint selection. No formatter or linter is configured in `pyproject.toml`; keep diffs focused and run `git diff --check` before committing.
+Use four-space indentation, `snake_case` for functions and variables, and `PascalCase` for classes. Log seeds, splits, preprocessing, device, and checkpoint selection. No formatter/linter is configured; keep diffs focused and run `git diff --check`.
 
 ## Testing and Experiment Checks
 
-There is no dedicated automated test suite or coverage target. `scripts/test.sh` launches a training example; it is not a unit-test runner and can consume substantial compute. For code changes, run relevant CLI help or a small, explicitly configured smoke run when appropriate, and report the command and outcome. Do not start full training jobs as a routine check.
+There is no dedicated automated test suite or coverage target. `scripts/test.sh` launches training and may consume substantial compute; it is not a unit-test runner. Prefer relevant CLI help or a small configured smoke run, and report commands and outcomes. Avoid full training jobs for routine checks.
 
 ## Data, Configuration, and Outputs
 
-Keep `.env`, credentials, patient metadata, images, and generated model artifacts out of version control. Configure dataset locations through the environment variables documented in `docs/replication-guide.md`. Record dataset version/split and any differences from the paper in experiment documentation; never describe defaults as paper settings without source verification.
+Keep `.env`, credentials, patient metadata, images, and model artifacts out of Git. Configure data paths as documented in `docs/replication-guide.md`. Record dataset version/split and paper deviations; verify paper settings against the source.
 
 ## Commits and Pull Requests
 
-Recent history uses short, imperative-style subjects (for example, `Add TorchTPU CheXpert ResNet-18 experiment`). Use the same pattern and keep commits focused. A pull request should explain the change, list relevant commands/checks and results, link related issues or experiment reports, and call out data/protocol deviations. Include screenshots only when a visual artifact changes.
+Use short imperative commit subjects (for example, `Add TorchTPU CheXpert ResNet-18 experiment`) and focused commits. PRs should explain changes, list checks/results, link issues or reports, and note data/protocol deviations. Add screenshots when visual artifacts change.
