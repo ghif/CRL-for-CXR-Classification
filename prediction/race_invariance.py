@@ -26,6 +26,157 @@ num_classes_disease = 2
 num_workers = 8
 
 
+def resolve_accelerator(requested):
+    """Resolve a requested execution device without silently falling back."""
+    if requested == "auto":
+        try:
+            current = torch.accelerator.current_accelerator()
+        except (AttributeError, RuntimeError):
+            current = None
+        if current is not None and getattr(current, "type", None) == "tpu":
+            if not torch.accelerator.is_available():
+                raise RuntimeError("TorchTPU is registered but no TPU device is available")
+            return "tpu"
+        return "cuda" if torch.cuda.is_available() else "cpu"
+
+    if requested == "tpu":
+        try:
+            import torch_tpu  # noqa: F401 - registers the native PyTorch TPU backend
+        except ImportError as exc:
+            raise RuntimeError(
+                "TPU requested, but torch-tpu is not installed in this environment"
+            ) from exc
+        try:
+            current = torch.accelerator.current_accelerator()
+            available = torch.accelerator.is_available()
+        except (AttributeError, RuntimeError) as exc:
+            raise RuntimeError(
+                "TPU requested, but this PyTorch build has no registered TPU backend"
+            ) from exc
+        if current is None or getattr(current, "type", None) != "tpu" or not available:
+            raise RuntimeError("TPU requested, but no TorchTPU device is available")
+        return "tpu"
+
+    if requested == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested, but no CUDA device is available")
+    return requested
+
+
+def _move_batch_to_device(batch, device):
+    return {
+        name: value.to(device) if torch.is_tensor(value) else value
+        for name, value in batch.items()
+    }
+
+
+def _save_tpu_checkpoint(model, path, epoch, global_step, hparams):
+    state_dict = {
+        name: value.detach().cpu()
+        for name, value in model.state_dict().items()
+    }
+    torch.save(
+        {
+            "state_dict": state_dict,
+            "hyper_parameters": {
+                "num_classes": num_classes_disease,
+                "inv_loss_coefficient": hparams.inv_loss_coefficient,
+            },
+            "epoch": epoch,
+            "global_step": global_step,
+        },
+        path,
+    )
+
+
+def _validate_tpu(model, dataloader, device):
+    model.eval()
+    weighted_loss = 0.0
+    sample_count = 0
+    with torch.no_grad():
+        for batch in dataloader:
+            batch = _move_batch_to_device(batch, device)
+            loss_class, _ = model.process_batch(batch)
+            count = int(batch["label"].shape[0])
+            weighted_loss += float(loss_class.detach().cpu()) * count
+            sample_count += count
+    if sample_count == 0:
+        raise RuntimeError("Validation loader produced no samples")
+    return weighted_loss / sample_count
+
+
+def train_tpu(model, datamodule, logger, hparams):
+    """Train on the single TPU using ordinary eager PyTorch, not Lightning/XLA."""
+    device = torch.device("tpu")
+    model.to(device)
+    optimizer = model.configure_optimizers()
+    train_loader = datamodule.train_dataloader()
+    val_loader = datamodule.val_dataloader()
+    log_dir = logger.log_dir
+    checkpoint_dir = os.path.join(log_dir, "checkpoints")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    best_path = os.path.join(checkpoint_dir, "best.ckpt")
+    last_path = os.path.join(checkpoint_dir, "last.ckpt")
+    best_val_loss = float("inf")
+    global_step = 0
+    max_steps = 5 if hparams.test else None
+    val_interval = 2 if hparams.test else 300
+    checkpoint_interval = 301
+    last_validated_step = -1
+
+    for epoch in range(hparams.epochs):
+        model.train()
+        for batch_idx, batch in enumerate(train_loader):
+            batch = _move_batch_to_device(batch, device)
+            invariant_batch = batch["image"].ndim == 5
+            process_batch = model.process_batch_list if invariant_batch else model.process_batch
+            optimizer.zero_grad(set_to_none=True)
+            loss_class, loss_inv = process_batch(batch)
+            loss = loss_class + loss_inv
+            loss.backward()
+            optimizer.step()
+            global_step += 1
+
+            if global_step % 5 == 0:
+                logger.experiment.add_scalar(
+                    "train_loss_class", float(loss_class.detach().cpu()), global_step
+                )
+                inv_value = (
+                    float(loss_inv.detach().cpu())
+                    if torch.is_tensor(loss_inv)
+                    else float(loss_inv)
+                )
+                logger.experiment.add_scalar("train_loss_inv", inv_value, global_step)
+
+            if global_step % checkpoint_interval == 0:
+                _save_tpu_checkpoint(model, last_path, epoch, global_step, hparams)
+
+            epoch_finished = batch_idx + 1 == len(train_loader)
+            should_validate = global_step % val_interval == 0 or epoch_finished
+            if should_validate and last_validated_step != global_step:
+                val_loss = _validate_tpu(model, val_loader, device)
+                logger.experiment.add_scalar("val_loss_class", val_loss, global_step)
+                logger.experiment.add_scalar("val_loss_inv", 0.0, global_step)
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    _save_tpu_checkpoint(model, best_path, epoch, global_step, hparams)
+                last_validated_step = global_step
+                model.train()
+
+            if max_steps is not None and global_step >= max_steps:
+                break
+
+        if global_step > 0:
+            _save_tpu_checkpoint(model, last_path, epoch, global_step, hparams)
+        if max_steps is not None and global_step >= max_steps:
+            break
+
+    if hparams.test:
+        return last_path
+    if not os.path.exists(best_path):
+        best_path = last_path
+    return best_path
+
+
 def datafiles(dataset: Literal["chexpert", "mimic"]):
     files = [
         f"datafiles/{dataset}/{dataset}.sample.{split}.csv"
@@ -98,6 +249,11 @@ def test(model, data_loader, device, test_run):
 def main(hparams):
     # sets seeds for numpy, torch, python.random and PYTHONHASHSEED.
     pl.seed_everything(hparams.seed, workers=True)
+    accelerator = resolve_accelerator(hparams.accelerator)
+    if accelerator == "tpu" and hparams.gpus != 1:
+        raise ValueError(
+            "This training entry point currently supports one TPU device; set --gpus 1"
+        )
 
     # model
     model_type = {
@@ -220,24 +376,31 @@ def main(hparams):
         out_dir = os.path.join(out_dir, "non_invariant")
     os.makedirs(out_dir, exist_ok=True)
 
-    # Trainer
-    checkpoint_callback = ModelCheckpoint(
-        monitor="val_loss_class",
-        mode="min",
-        save_last=True,
-        every_n_train_steps=0 if hparams.test else 301,
-    )
-    trainer = pl.Trainer(
-        callbacks=[checkpoint_callback],
-        log_every_n_steps=5,
-        max_epochs=hparams.epochs,
-        devices=hparams.gpus,
-        logger=TensorBoardLogger(out_dir),
-        max_steps=5 if hparams.test else -1,
-        val_check_interval=2 if hparams.test else 300,
-    )
-    trainer.logger._default_hp_metric = False
-    log_dir = trainer.log_dir
+    # Lightning has no native TorchTPU accelerator integration. Use the
+    # repository's Lightning path for CPU/CUDA and an eager PyTorch loop for TPU.
+    logger = TensorBoardLogger(out_dir)
+    trainer = None
+    if accelerator == "tpu":
+        log_dir = logger.log_dir
+    else:
+        checkpoint_callback = ModelCheckpoint(
+            monitor="val_loss_class",
+            mode="min",
+            save_last=True,
+            every_n_train_steps=0 if hparams.test else 301,
+        )
+        trainer = pl.Trainer(
+            callbacks=[checkpoint_callback],
+            log_every_n_steps=5,
+            max_epochs=hparams.epochs,
+            accelerator="gpu" if accelerator == "cuda" else "cpu",
+            devices=hparams.gpus,
+            logger=logger,
+            max_steps=5 if hparams.test else -1,
+            val_check_interval=2 if hparams.test else 300,
+        )
+        trainer.logger._default_hp_metric = False
+        log_dir = trainer.log_dir
 
     # Sample images
     samples_dir = os.path.join(log_dir, 'samples')
@@ -250,21 +413,25 @@ def main(hparams):
         )
 
     # Train
-    trainer.fit(model, data_train)
-
-    # Test
-    if hparams.test:
-        model_path = trainer.checkpoint_callback.last_model_path
+    if accelerator == "tpu":
+        model_path = train_tpu(model, data_train, logger, hparams)
+        checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
+        model.load_state_dict(checkpoint["state_dict"])
+        device = torch.device("tpu")
     else:
-        model_path = trainer.checkpoint_callback.best_model_path
-    model = model_type.load_from_checkpoint(
-        model_path, 
-        num_classes=num_classes_disease,
-        inv_loss_coefficient=hparams.inv_loss_coefficient,
-    )
-
-    use_cuda = torch.cuda.is_available()
-    device = torch.device("cuda:" + str(hparams.dev) if use_cuda else "cpu")
+        trainer.fit(model, data_train)
+        if hparams.test:
+            model_path = trainer.checkpoint_callback.last_model_path
+        else:
+            model_path = trainer.checkpoint_callback.best_model_path
+        model = model_type.load_from_checkpoint(
+            model_path,
+            num_classes=num_classes_disease,
+            inv_loss_coefficient=hparams.inv_loss_coefficient,
+        )
+        device = torch.device(
+            "cuda:" + str(hparams.dev) if accelerator == "cuda" else "cpu"
+        )
 
     model.to(device)
 
@@ -313,14 +480,20 @@ def main(hparams):
     write_dfs("val")
     write_dfs("test")
     write_dfs("ood")
+    if accelerator == "tpu":
+        logger.experiment.close()
 
 
 def cli():
     parser = ArgumentParser()
     parser.add_argument('--seed', type=int, default=42)
 
-    parser.add_argument('--gpus', type=int, default=1)
+    parser.add_argument('--gpus', type=int, default=1,
+                        help='Number of CPU/CUDA devices; TPU mode currently requires 1')
     parser.add_argument('--dev', type=int, default=0)
+    parser.add_argument('--accelerator', choices=['auto', 'cpu', 'cuda', 'tpu'],
+                        default='auto',
+                        help='auto prefers an available TorchTPU device, then CUDA, then CPU')
     parser.add_argument('--test', action="store_true")
 
     parser.add_argument('--epochs', type=int, default=10)
@@ -347,3 +520,7 @@ def cli():
     args = parser.parse_args()
 
     main(args)
+
+
+if __name__ == "__main__":
+    cli()
