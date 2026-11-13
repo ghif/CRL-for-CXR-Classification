@@ -192,8 +192,8 @@ class CXRDataset(Dataset):
         }
 
     def get_samples(self, item):
-        np.random.seed(item)
-
+        # DataLoader seeds NumPy per worker; keep advancing its RNG so each
+        # iteration resamples groups instead of repeating the same tuple by index.
         # Sample a disease
         diseases = np.array(list(self.label_count.keys()))
         disease = np.random.choice(diseases, size=1)[0]
