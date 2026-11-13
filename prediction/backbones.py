@@ -67,7 +67,11 @@ class BaseNet(ABC, pl.LightningModule):
         img, label_class, _ = self.unpack_batch(batch)
         embedding, out_disease = self.forward(img)
 
-        if label_class.ndim == 1:
+        if out_disease.shape[-1] == 1:
+            loss_class = F.binary_cross_entropy_with_logits(
+                out_disease.squeeze(-1), label_class.float()
+            )
+        elif label_class.ndim == 1:
             # Multi-class classification
             loss_class = F.cross_entropy(out_disease, label_class)
         else:
@@ -91,7 +95,11 @@ class BaseNet(ABC, pl.LightningModule):
             embedding, out_disease = self.forward(img[i])
             entropy += compute_entropy(embedding, reduction='mean')
 
-            if label_class[i].ndim == 1:
+            if out_disease.shape[-1] == 1:
+                loss_class += F.binary_cross_entropy_with_logits(
+                    out_disease.squeeze(-1), label_class[i].float()
+                )
+            elif label_class[i].ndim == 1:
                 loss_class += F.cross_entropy(out_disease, label_class[i])
             else:    
                 loss_class += F.binary_cross_entropy_with_logits(out_disease, label_class[i])
