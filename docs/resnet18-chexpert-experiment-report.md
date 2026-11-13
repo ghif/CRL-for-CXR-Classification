@@ -61,7 +61,23 @@ Training augmentation follows the repository loader: random horizontal flip with
 
 ### 4.1 Architecture
 
-The feature extractor is torchvision ResNet-18 initialized with `ResNet18_Weights.IMAGENET1K_V1`. Its final 1,000-class layer is replaced by an identity layer. A new linear classifier maps the 512-dimensional representation to two logits: No Finding and the target disease.
+The feature extractor is torchvision ResNet-18 initialized with `ResNet18_Weights.IMAGENET1K_V1`, the ImageNet-1K pretrained weights. A grayscale radiograph is repeated across three channels and passed through the standard ResNet-18 stem (7 × 7 convolution, batch normalization, ReLU, and max pooling), then four residual stages with two basic residual blocks per stage and 64, 128, 256, and 512 output channels. Adaptive average pooling produces a 512-dimensional feature vector.
+
+The torchvision 1,000-class `fc` layer is replaced with `nn.Identity`; its ImageNet classifier weights are discarded and do not participate in this experiment. A new `nn.Linear(512, 2)` layer maps the feature vector to two logits, ordered as No Finding and the selected disease. This is instantiated separately for each task and seed.
+
+### 4.1.1 Parameters updated during fine-tuning
+
+This is **full-backbone fine-tuning**, not a frozen-feature-extractor experiment. The code does not set any backbone parameter's `requires_grad` to false. Adam receives all parameters from both the ResNet backbone and the new classifier:
+
+| Component | Parameters adjusted by gradient descent? | Learning rate | Details |
+|---|---|---:|---|
+| ResNet-18 convolution layers | Yes | 0.001 | Convolution weights throughout the stem and all residual blocks are updated from the CheXpert classification loss. |
+| ResNet-18 BatchNorm affine parameters | Yes | 0.001 | Trainable scale (`weight`) and offset (`bias`) parameters are optimized with the backbone. |
+| ResNet-18 BatchNorm running buffers | No | N/A | `running_mean`, `running_var`, and `num_batches_tracked` are statistics, not gradient-trained parameters. The TPU hook updates these buffers during training batches. |
+| Replaced ImageNet `fc` layer | No | N/A | Removed and replaced by `nn.Identity`, so its original 1,000-class weights are not used or fine-tuned. |
+| New two-class linear head | Yes | 0.0001 | Both the 512 × 2 weight matrix and 2-element bias are learned from the task labels. |
+
+For the standard torchvision ResNet-18, the retained backbone has 11,176,512 trainable parameters; the new two-logit classifier has 1,026. Therefore 11,177,538 scalar parameters are exposed to the optimizer per task. The run optimizes the pretrained convolutional and BatchNorm affine values from their ImageNet initialization rather than freezing them. Running-statistic buffers are maintained separately from this parameter count.
 
 ### 4.2 Objective and optimization
 
