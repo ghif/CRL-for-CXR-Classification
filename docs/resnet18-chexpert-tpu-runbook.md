@@ -1,150 +1,162 @@
 # ResNet-18 CheXpert baseline on TorchTPU
 
-This runbook records the steps used to prepare the Hugging Face CheXpert mirror and start the two-task ResNet-18 baseline from the project workspace. The current execution is an **adapted reproduction**: it uses the public Hugging Face image mirror and an explicitly validated TorchTPU BatchNorm workaround. It is not the paper's complete Table 1 matrix.
+This is the manual, end-to-end procedure for reproducing the repository's two-task ResNet-18 baseline from the Hugging Face CheXpert mirror. It covers the exact single-seed run recorded in this repository and the checks needed before launching it. The result is an **adapted reproduction**, not the paper's full Table 1 replication; protocol differences are listed below and in the [experiment report](resnet18-chexpert-experiment-report.md).
 
-## 1. Scope and protocol
+## 1. Experiment being reproduced
 
-The run covers the ordinary classification baseline for two binary tasks:
+The two independent binary tasks are No Finding versus Pleural Effusion and No Finding versus Cardiomegaly. The reported run uses seed 43 for each task, an ImageNet `IMAGENET1K_V1` ResNet-18 backbone, 224 × 224 inputs, batch size 32, Adam for 20 epochs, backbone learning rate `0.001`, and classifier learning rate `0.0001`. Each task's checkpoint is chosen by maximum validation AUROC; test AUROC is calculated once from that checkpoint.
 
-- No Finding versus Pleural Effusion
-- No Finding versus Cardiomegaly
+The paper reports ten seeds and a top-five summary. The run documented here has one seed per task. It also uses the Hugging Face mirror, a two-logit cross-entropy objective (the paper describes binary cross-entropy), and a TorchTPU BatchNorm statistics workaround. Do not interpret its scores as a like-for-like comparison with the paper.
 
-The paper-inspired settings are 224 × 224 inputs, an ImageNet-pretrained ResNet-18, Adam, backbone learning rate `0.001`, classifier learning rate `0.0001`, batch size 32, and 20 epochs. The paper reports ten seeds (`42`–`51` here as a reproducibility choice) and selects the top five by validation AUROC for its summary. The user later narrowed this execution to one result per task to get an initial baseline sooner. The final run therefore uses seed 43 for each task and reports individual validation/test AUROCs; it does not estimate a multi-seed mean or standard deviation.
+| Task | Train | Validation | Test | Best epoch | Test AUROC |
+|---|---:|---:|---:|---:|---:|
+| No Finding vs Pleural Effusion | 37,529 | 6,135 | 18,826 | 12 | 0.9476 |
+| No Finding vs Cardiomegaly | 15,867 | 2,634 | 8,205 | 19 | 0.9377 |
 
-The paper specifies binary cross-entropy, while the repository's ResNet implementation uses a two-logit head and `CrossEntropyLoss`. The current runner follows the repository implementation; this is a protocol deviation to disclose with results. The paper also does not specify seed values or an unambiguous within-seed checkpoint epoch rule. Seeds 42–51 and max validation AUROC are recorded choices, not claims about paper-specified values. See [the broader replication plan](chexpert-table1-training-plan.md) for other paper ambiguities and the full Table 1 scope.
+Counts above are after the loader's cohort filtering. The training loader drops the last incomplete batch.
 
-## 2. Workspace and environment
+## 2. Requirements and workspace setup
 
-Run the commands from a clone of this repository. The experiment used a conda environment named `crl-cxr`:
+Use a Linux host with a TPU runtime visible to TorchTPU, sufficient local storage for the Parquet shards and 71,096 extracted PNGs, and this repository checked out. The run was recorded with Python 3.13, PyTorch `2.15.0+cpu`, torchvision `0.29.2+cpu`, `torch-tpu` `0.2.0`, and `libtpu` `0.0.52`. The project Poetry environment is separate and is not the environment used for this run.
+
+From a shell with the host's conda installation available, activate the existing TPU environment or create one from the repository recipe. For the existing environment used in the recorded run:
 
 ```bash
+source /mnt/data/miniconda/etc/profile.d/conda.sh
 conda activate crl-cxr
-cd "$(git rev-parse --show-toplevel)"
+cd /mnt/data/firstmate/projects/CRL-for-CXR-Classification
 ```
 
-TorchTPU setup is recorded in [`environment-torchtpu.yml`](../environment-torchtpu.yml). This environment uses CPU PyTorch wheels plus the `torch-tpu` plugin; the model is explicitly moved to the TPU at runtime. The installed versions during this run were Python 3.13, PyTorch `2.15.0+cpu`, torchvision `0.29.2+cpu`, `torch-tpu` `0.2.0`, and `libtpu` `0.0.52`. The Hugging Face Parquet reader dependencies `datasets` and `pyarrow` were also installed in this environment.
-
-In the existing `crl-cxr` environment, the Parquet dependencies can be installed with:
+If setting up a new environment instead, the checked-in recipe names it `crl-cxr-torchtpu`:
 
 ```bash
-python -m pip install 'datasets>=3,<5' 'pyarrow>=18,<24'
+conda env create --solver classic -f environment-torchtpu.yml
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate crl-cxr-torchtpu
+python -m pip install 'huggingface_hub>=0.30' 'datasets>=3,<5' 'pyarrow>=18,<24'
 ```
 
-Check versions and device visibility before launching:
+The first command installs TorchTPU and the core project libraries. The final command installs the Hugging Face downloader and Parquet reader used for data acquisition and extraction. Record actual versions when reproducing; package updates can change behavior.
+
+Check the interpreter, packages, and TPU before downloading data:
 
 ```bash
-python -c 'import torch, torch_tpu, importlib.metadata as m; print("torch", torch.__version__); print("torchvision", m.version("torchvision")); print("torch-tpu", m.version("torch-tpu")); print("libtpu", m.version("libtpu")); print("accelerator", torch.accelerator.current_accelerator()); print("count", torch.accelerator.device_count()); print("available", torch.accelerator.is_available())'
+which python
+python --version
+python -c 'import torch, torch_tpu, torchvision, importlib.metadata as m; print("torch", torch.__version__); print("torchvision", torchvision.__version__); print("torch-tpu", m.version("torch-tpu")); print("libtpu", m.version("libtpu")); print("accelerator", torch.accelerator.current_accelerator()); print("count", torch.accelerator.device_count()); print("available", torch.accelerator.is_available())'
 ```
 
-In this environment the sandboxed probe reported no device, while the same probe outside the sandbox found one TPU. Run the TPU probe and training process in an execution context that can access the host TPU runtime. Do not silently let `CXR_DEVICE=tpu` fall back to CPU: the runner raises an error if TorchTPU is unavailable.
+Proceed only when the current accelerator is TPU, the device count is nonzero, and `available` is true. The runner deliberately raises an error if `CXR_DEVICE=tpu` is requested without an available TPU. A CPU-only shell/container may not expose the host TPU even when the machine has one; run the commands in the TPU-enabled host context. The recorded host logged a PJRT API version difference (plugin 0.117, framework 0.116), although initialization and training worked.
 
-The runtime logged a PJRT API version difference (`0.117` in the plugin and `0.116` in the PyTorch framework). Device initialization and training nevertheless worked. Preserve this warning in experiment provenance if the environment is rebuilt or updated.
+## 3. Obtain the data and the project split files
 
-## 3. Obtain and inspect the Hugging Face mirror
-
-The dataset repo used was [`danjacobellis/chexpert`](https://huggingface.co/datasets/danjacobellis/chexpert). Its training Parquet shards contain both row metadata and image bytes. The table reported 223,414 train rows across 23 shards and 234 validation rows. The local split comes from the project's existing CheXpert sample CSVs; the runner's train/validation/test examples are therefore selected from the mirror's train records, not the mirror's small validation split.
-
-The train shards were downloaded under the ignored local `chexpert/` directory:
+The image source is the [`danjacobellis/chexpert` Hugging Face dataset](https://huggingface.co/datasets/danjacobellis/chexpert). Review its dataset card, access conditions, and redistribution terms before downloading or sharing data. The command below downloads the 23 training Parquet shards, which contain embedded image bytes; it is not a metadata-only download and needs substantial disk space.
 
 ```bash
-python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='danjacobellis/chexpert', repo_type='dataset', local_dir='chexpert/hf', allow_patterns=['data/train-*.parquet'])"
+mkdir -p chexpert
+python -c "from huggingface_hub import snapshot_download; print(snapshot_download(repo_id='danjacobellis/chexpert', repo_type='dataset', local_dir='chexpert/hf', allow_patterns=['data/train-*.parquet']))"
 ```
 
-This fetched the Parquet records, including image payloads, rather than just metadata. The HF card encodes labels as 0 = unlabeled, 1 = uncertain, 2 = absent, and 3 = present. Its AP/PA code interpretation is uploader-provided. Before use, the HF paths and labels were matched against the repository staging metadata and split CSVs: all 71,096 selected image paths matched, disease labels matched, and split assignments had zero mismatches. The AP/PA mapping also had zero mismatches. Sex had one mismatch per split and is not used in this baseline.
+Confirm the expected shards are present:
 
-Review the dataset card and its terms before redistribution. The image files and row-level manifests remain local and ignored by git.
+```bash
+find chexpert/hf/data -maxdepth 1 -name 'train-*.parquet' -type f | wc -l
+```
 
-## 4. Prepare the selected images and CSVs
+The expected count is 23. The downloaded train split has 223,414 rows. The mirror's separate 234-row validation split is **not** used for this experiment's validation set.
 
-The preparation script is [`chexpert/prepare_hf_baseline.py`](../chexpert/prepare_hf_baseline.py). It reads the project's `chexpert.sample.{train,val,test}.csv` files from the existing local staging tree, maps their `path_preproc` values to HF paths, scans Parquet path columns, and extracts only the 71,096 paths needed by the two tasks and three splits.
+Obtain the existing project split CSVs from the approved project data/artifact source; the CSVs are ignored by Git and are not committed in this repository. Place these files in `datafiles/chexpert/`:
 
-The script resizes the grayscale JPEG bytes to 224 × 224 with `skimage.transform.resize(..., preserve_range=True)`, converts to `uint8`, and writes PNGs under `chexpert/hf_preprocessed/preproc_224x224/`. It copies the three sample CSVs into `datafiles/chexpert/` for the runner. Launch it from the repository root:
+```text
+chexpert.sample.train.csv
+chexpert.sample.val.csv
+chexpert.sample.test.csv
+```
+
+If they are stored elsewhere, set `CXR_CSV_SOURCE_DIR` to their directory before running the preparation script. Do not substitute random splits: preserving these assignments is necessary to reproduce the reported evaluation. Check the files before continuing:
+
+```bash
+for split in train val test; do
+  test -s "datafiles/chexpert/chexpert.sample.${split}.csv" || exit 1
+done
+python -c 'import pandas as pd; from pathlib import Path; p=Path("datafiles/chexpert"); [(lambda d,s: print(s, "rows", len(d), "columns", len(d.columns), "path_preproc", "path_preproc" in d))(pd.read_csv(p/f"chexpert.sample.{s}.csv"), s) for s in ("train","val","test")]'
+```
+
+Each CSV must contain the `path_preproc` field and the target, `No Finding`, and loader-required metadata columns used by `prediction/datasets/cxr.py`. If preparation reports an unexpected path shape or count, stop and resolve the split/source mismatch; do not edit paths to force the script through.
+
+## 4. Extract and preprocess the selected images
+
+Run the preparation script from the repository root:
 
 ```bash
 python chexpert/prepare_hf_baseline.py
 ```
 
-The completed `chexpert/preparation.json` reported:
+The script reads the three split CSVs, converts their `path_preproc` values to Hugging Face paths, scans path columns in the Parquet shards, and extracts the 71,096 required images. Each grayscale JPEG is resized to 224 × 224 using `skimage.transform.resize(..., preserve_range=True)`, cast to `uint8`, and saved as PNG at the same relative path beneath `chexpert/hf_preprocessed/`. The CSV files are copied into `datafiles/chexpert/` if a separate `CXR_CSV_SOURCE_DIR` was supplied.
 
-- 223,414 rows in the HF train split
-- 71,096 selected paths, all extracted and present
-- 32 comparison images, zero exact pixel matches against the previously staged copies
-- mean SSIM 0.9467 and minimum SSIM 0.9247 for those 32 comparisons
+The script prints a JSON audit and writes `chexpert/preparation.json`. Confirm that `selected_paths` and `extracted_missing` are 71,096 and `selected_images_complete` is `true`. The recorded preparation found all selected paths and produced all images. A comparison of 32 images with an existing staged copy found no pixel-identical files (mean SSIM 0.9467; minimum 0.9247); the run consistently used the Hugging Face bytes.
 
-Thus the evaluation uses the HF image bytes, not the differing previously staged image files. The loader repeats each grayscale image into three channels for ResNet. The repository `CXRDataset` supplies its training augmentation (random horizontal flip and random affine rotation/scale) and reads image intensities as float values from the saved PNG; this run does not add ImageNet mean/std normalization.
+The `CXRDataset` loader repeats grayscale values across three channels and reads them as float values without ImageNet mean/std normalization. It applies random horizontal flip and, with probability 0.5, an affine transform with rotation up to 15 degrees and scale 0.9–1.1 to training samples; validation and test samples are unaugmented. For each task, the loader keeps examples where exactly one of `No Finding` and the target disease is positive, assigns disease=1 and No Finding=0, and excludes rows where both/neither are positive. It does not use race or sex for this baseline.
 
-The local paths under `chexpert/` and `datafiles/chexpert/` are ignored by git. Keep them, checkpoints, and prediction files out of commits and public artifacts.
+## 5. Verify TPU execution and BatchNorm handling
 
-For each task, `CXRDataset` retains records where exactly one of `No Finding` or the task label equals 1. Rows where neither label is 1 and rows where both are 1 are excluded. The target is 1 for the disease and 0 for No Finding. It maps AP to view code 0 and PA to view code 1, and the baseline allows both codes (`protected_race_set=[0, 1]`); no race or sex subgroup objective is used.
+The runner applies bfloat16 autocast to model forward passes when `CXR_TPU_AMP=1`; logits and loss are converted/calculated in float32. Before a long run, ensure the TPU check in section 2 succeeds. The recorded environment also passed a ResNet forward/backward smoke check on TPU.
 
-## 5. TPU preflight and BatchNorm behavior
+The installed TorchTPU build did not update BatchNorm `running_mean` and `running_var` buffers during training. Stale statistics caused validation AUROC near 0.50. `chexpert/run_resnet18_baseline.py` installs a forward-pre-hook on the 20 ResNet-18 BatchNorm layers to compute channel mean and unbiased variance for each training batch and apply the PyTorch momentum update. A constant-input TPU probe verified the update. This workaround is part of the experiment; recheck it if changing TorchTPU, PyTorch, or libtpu versions. The issue is tracked in the [TorchTPU issue tracker](https://github.com/google-pytorch/torch_tpu/issues/6465).
 
-Before the full run, a small ResNet forward/backward pass on `tpu` succeeded with bfloat16 autocast and cross-entropy. A direct BatchNorm probe then showed a backend problem in the installed TorchTPU build: a training `BatchNorm2d` call on constant input left `running_mean` at 0 and `running_var` at 1. Without valid running statistics, evaluation produced nearly saturated scores and AUROC around 0.50, despite falling training loss.
+## 6. Run one seed per task
 
-The runner therefore installs a forward-pre-hook on each of ResNet-18's 20 BatchNorm layers. For each training batch, the hook computes per-channel mean and unbiased variance over batch and spatial dimensions, then applies the normal PyTorch exponential moving average using the layer's momentum. A TPU probe confirmed the expected update (mean 0 → 0.5 and variance 1 → 0.9 for constant input 5 with momentum 0.1). With this hook, validation AUROC on Pleural Effusion seed 42 was 0.937–0.948 instead of about 0.50. This is an implementation workaround for the installed TPU backend, and is disclosed in each run's `config.json`.
-
-For a minimal device/backprop check, use the same model construction as `make_model()` in the runner, move the backbone and head to `torch.device("tpu")`, and run one batch under:
-
-```python
-with torch.autocast("tpu", dtype=torch.bfloat16):
-    logits = classifier(backbone(images))
-    loss = torch.nn.functional.cross_entropy(logits.float(), labels.long())
-loss.backward()
-```
-
-The TPU hook and AUROC behavior should be checked again after changing TorchTPU, PyTorch, or libtpu versions. TorchTPU's AMP interface is documented in its [API reference](https://torchtpu.readthedocs.io/en/latest/api_reference/); the BatchNorm running-stat issue is tracked in the [TorchTPU issue tracker](https://github.com/google-pytorch/torch_tpu/issues/6465).
-
-## 6. Launch the experiment
-
-From the repository root, launch the one-seed-per-task run in the TPU-accessible host context:
+Set the task and seed explicitly. The runner's defaults are seeds 42–51, so omitting `CXR_SEEDS=43` starts multiple seeds. Use the following command for the completed one-seed-per-task configuration:
 
 ```bash
-env \
-  PYTHONPATH="$PWD" \
+set -o pipefail
+PYTHONPATH="$PWD" \
   CXR_DEVICE=tpu \
   CXR_TPU_AMP=1 \
   CXR_NUM_WORKERS=4 \
   CXR_SEEDS=43 \
   CXR_TASKS='Pleural Effusion,Cardiomegaly' \
-  python chexpert/run_resnet18_baseline.py
+  python chexpert/run_resnet18_baseline.py 2>&1 | tee chexpert/resnet18-seed43.log
 ```
 
-`PYTHONPATH` is required because the script imports `prediction.datasets.cxr` while it is located under `chexpert/`. `CXR_DEVICE=tpu` selects the accelerator, `CXR_TPU_AMP=1` enables TPU bfloat16 autocast for model forward passes, four loader workers feed the TPU, and `CXR_SEEDS`/`CXR_TASKS` narrow the run. Remove those final two variables to run the original ten-seed schedule for both tasks. Inputs and labels are transferred to the TPU; predictions and checkpoints are copied back to CPU for serialization and AUROC computation. In the one-seed run, test evaluation occurs after the single validation-selected checkpoint is ready.
+This runs the tasks sequentially on one TPU, each for 20 epochs. It writes one JSON progress record per epoch and prints post-filter split counts. The first run downloads ImageNet pretrained weights if they are not already cached. Keep the terminal open until the process exits with status 0; `set -o pipefail` ensures a failed Python process is not hidden by `tee`.
 
-The runner prints one JSON record per task, seed, and epoch. It uses train, validation, and test counts after the project's binary cohort filters. The observed Pleural Effusion counts are 37,529 train, 6,135 validation, and 18,826 test examples; training drops the last incomplete batch, so 37,504 examples contribute to each epoch's loss.
+For only one task, set `CXR_TASKS='Pleural Effusion'` or `CXR_TASKS='Cardiomegaly'`. For a deliberately different seed, set `CXR_SEEDS` to that integer. To run the broader ten-seed protocol, specify `CXR_SEEDS='42,43,44,45,46,47,48,49,50,51'` knowingly: it is substantially longer and still does not make this an exact paper reproduction.
 
-## 7. Output layout and interpretation
+The runner reuses a completed seed when its checkpoint, history, and validation predictions exist. If an output folder already contains that seed, the console logs `reusing completed checkpoint`; the seed will not be retrained. The runner's output path is fixed at `chexpert/runs/resnet18_baseline_tpu_ce/`. Before intentionally repeating a seed from scratch, archive the existing output directory outside that path so old artifacts are not confused with new ones. Do not remove or overwrite outputs without first preserving any results you need.
 
-The active output root is:
+## 7. Inspect outputs and verify the result
+
+The expected output tree is:
 
 ```text
 chexpert/runs/resnet18_baseline_tpu_ce/
+├── config.json
+├── summary.json
+├── pleural_effusion/
+│   ├── summary.json
+│   └── seed_43/
+│       ├── best.pt
+│       ├── history.json
+│       ├── predictions.val_best.csv
+│       └── predictions.test.csv
+└── cardiomegaly/
+    ├── summary.json
+    └── seed_43/...
 ```
 
-Expected outputs:
+Inspect the configuration and summaries:
 
-```text
-config.json
-pleural_effusion/seed_42/best.pt
-pleural_effusion/seed_42/history.json
-pleural_effusion/seed_42/predictions.val_best.csv
-...
-pleural_effusion/summary.json
-cardiomegaly/...
-summary.json
+```bash
+python -m json.tool chexpert/runs/resnet18_baseline_tpu_ce/config.json
+python -m json.tool chexpert/runs/resnet18_baseline_tpu_ce/pleural_effusion/summary.json
+python -m json.tool chexpert/runs/resnet18_baseline_tpu_ce/cardiomegaly/summary.json
 ```
 
-Each completed seed stores its best validation-AUROC checkpoint, per-epoch training/validation history, and continuous positive-class validation scores. Each evaluated seed also gets `predictions.test.csv`. Per-task summaries report selected seeds and test AUROCs. A sample standard deviation is undefined for one seed and is stored as `null`. `config.json` records hyperparameters, source, accelerator, AMP, BatchNorm hook count, and deviations.
+For the recorded seed-43 run, expect best epochs 12 and 19, validation AUROCs 0.9497 and 0.9343, and test AUROCs 0.9476 and 0.9377 for Pleural Effusion and Cardiomegaly respectively. Minor numerical differences can occur across software/runtime versions. Confirm `config.json` shows device `tpu`, AMP enabled, and 20 BatchNorm hooks. Check histories contain 20 epochs and that test prediction CSVs have the expected number of examples before quoting the metrics. The report contains the complete epoch histories and paper comparison.
 
-Do not treat the earlier interrupted `resnet18_baseline/` artifacts as final results: that first attempt used one-logit BCE, ran on CPU, and was stopped. An intermediate TPU attempt used the correct two-logit head but had stale BatchNorm statistics and was also stopped. The current `resnet18_baseline_tpu_ce/` run is the active one with TPU, cross-entropy, and the BatchNorm workaround.
+## 8. Reproducibility notes and limitations
 
-## 8. Completed one-seed results recorded on 2026-11-13
+The source mirror's revision/hash, exact data file hashes, TPU model identifier, and a complete captured stdout log were not recorded for the original run. For new runs, save those along with Git revision, command, environment versions, split-file hashes, preparation JSON, and output hashes. Keep downloaded Parquet files, PNG images, patient-level CSVs, checkpoints, and logs local; they are under ignored paths and should not be committed or redistributed without permission.
 
-The initial ten-seed job was stopped during Pleural Effusion seed 44 at epoch 12, at the user's request to stop the multi-seed schedule. That incomplete seed produced no completed checkpoint and is not included. Completed Pleural Effusion seed 43 was reused; it had the highest validation AUROC among the two completed seeds (42 and 43). Cardiomegaly seed 43 was trained for 20 epochs. Each task was evaluated on its test split once:
-
-| Task | Seed | Best epoch | Validation AUROC | Test AUROC | Test examples |
-|---|---:|---:|---:|---:|---:|
-| No Finding vs Pleural Effusion | 43 | 12 | 0.9497 | 0.9476 | 18,826 |
-| No Finding vs Cardiomegaly | 43 | 19 | 0.9343 | 0.9377 | 8,205 |
-
-These are single-seed baseline results, not the paper's top-five-of-ten mean ± standard deviation. Pleural Effusion seed 43 was selected as best among only the two completed candidates before the run was narrowed, not among all ten seeds. Cardiomegaly has one seed only. The test split was not used to select either checkpoint. The output root's `summary.json` and each seed's prediction/history/checkpoint files contain the machine-readable results. Retain the data-source, protocol, and TorchTPU BatchNorm deviations stated above when reporting them.
+The reported single-seed AUROCs (0.9476 Pleural Effusion; 0.9377 Cardiomegaly) are individual test results. The paper reports a top-five-of-ten summary. Other deviations include mirror image bytes, the repository's two-logit cross-entropy head instead of the paper's stated BCE, and the TPU BatchNorm workaround. See the [full report](resnet18-chexpert-experiment-report.md), [replication guide](replication-guide.md), and [Table 1 plan](chexpert-table1-training-plan.md) when comparing protocols.
