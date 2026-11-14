@@ -163,7 +163,11 @@ def evaluate_task(
     targets: list[np.ndarray] = []
     scores: list[np.ndarray] = []
     for batch_index, (images, labels) in enumerate(loader, start=1):
-        logits = classifier(backbone(images.to(device)))
+        if device.type == "tpu":
+            with torch.autocast("tpu", dtype=torch.bfloat16):
+                logits = classifier(backbone(images.to(device)))
+        else:
+            logits = classifier(backbone(images.to(device)))
         scores.append(torch.softmax(logits.float(), dim=1)[:, 1].cpu().numpy())
         targets.append(labels.numpy().astype(np.int64))
         if batch_index % 20 == 0 or batch_index == total_batches:
@@ -208,8 +212,14 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--preprocess-workers", type=int, default=4)
     args = parser.parse_args()
+    args.output_root = args.output_root.resolve()
 
     device = torch.device(args.device)
+    if device.type == "tpu":
+        import torch_tpu  # noqa: F401  # Register the TorchTPU device.
+
+        if not torch.accelerator.is_available() or torch.accelerator.current_accelerator().type != "tpu":
+            raise RuntimeError("CXR_DEVICE=tpu was requested, but TorchTPU reports no available TPU")
     torch.set_num_threads(4 if device.type == "cpu" else 32)
     with args.labels.open(encoding="utf-8-sig", newline="") as stream:
         rows = list(csv.DictReader(stream))
@@ -246,6 +256,7 @@ def main() -> None:
         "source_labels_sha256": sha256(args.labels),
         "samples": len(rows),
         "device": str(device),
+        "tpu_amp": device.type == "tpu",
         "batch_size": args.batch_size,
         "num_workers": args.num_workers,
         "pydicom_version": importlib.metadata.version("pydicom"),

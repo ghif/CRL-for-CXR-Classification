@@ -64,9 +64,18 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--weights", choices=["all", *WEIGHTS], default="all")
+    parser.add_argument("--compile-model", action="store_true", help="Compile fixed-shape inference with TorchTPU")
     args = parser.parse_args()
+    args.output_root = args.output_root.resolve()
 
     device = torch.device(args.device)
+    if device.type == "tpu":
+        import torch_tpu  # noqa: F401  # Register the TorchTPU device.
+
+        if not torch.accelerator.is_available() or torch.accelerator.current_accelerator().type != "tpu":
+            raise RuntimeError("--device tpu was requested, but TorchTPU reports no available TPU")
+    if args.compile_model and device.type != "tpu":
+        raise ValueError("--compile-model requires --device tpu")
     torch.set_num_threads(4 if device.type == "cpu" else 32)
     with args.labels.open(encoding="utf-8-sig", newline="") as stream:
         rows = list(csv.DictReader(stream))
@@ -96,6 +105,10 @@ def main() -> None:
         pathologies = list(model.pathologies)
         columns = [pathologies.index(PATHOLOGIES[label]) for label in LABELS]
         model = model.to(device).eval()
+        if args.compile_model:
+            # XRV's range diagnostic uses Python-side checks Dynamo cannot trace.
+            xrv.utils.warning_log["norm_check"] = True
+            model = torch.compile(model, backend="tpu", dynamic=False)
         weights_file = Path(model.weights_filename_local)
         all_targets: list[np.ndarray] = []
         all_scores: list[np.ndarray] = []
@@ -103,7 +116,17 @@ def main() -> None:
         with torch.inference_mode():
             for batch_index, (image, target) in enumerate(loader, start=1):
                 x = xrv.datasets.normalize(image.numpy(), 255)
-                scores = model(torch.from_numpy(x).to(device))[:, columns].float().cpu().numpy()
+                x = torch.from_numpy(x).to(device)
+                actual_batch_size = len(target)
+                if device.type == "tpu" and actual_batch_size < args.batch_size:
+                    padding = x[:1].expand(args.batch_size - actual_batch_size, *x.shape[1:])
+                    x = torch.cat((x, padding), dim=0)
+                if device.type == "tpu":
+                    with torch.autocast("tpu", dtype=torch.bfloat16):
+                        output = model(x)
+                else:
+                    output = model(x)
+                scores = output[:actual_batch_size, columns].float().cpu().numpy()
                 all_targets.append(target.numpy())
                 all_scores.append(scores)
                 if batch_index % 20 == 0 or batch_index == len(loader):
@@ -146,7 +169,10 @@ def main() -> None:
             "weights_path": str(weights_file),
             "weights_sha256": sha256(weights_file),
             "torchxrayvision_version": importlib.metadata.version("torchxrayvision"),
+            "torch_version": torch.__version__,
             "device": str(device),
+            "tpu_amp": device.type == "tpu",
+            "torch_compile": args.compile_model,
             "batch_size": args.batch_size,
             "samples": len(rows),
             "tasks": task_metrics,
