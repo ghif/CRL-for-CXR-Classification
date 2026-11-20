@@ -108,6 +108,18 @@ On PadChest (`N = 11,111`), both models achieve higher 6-pathology macro AUROC o
 
 ---
 
+## Comparison with Published Literature (MICCAI 2026 CoWA)
+
+We compared our unadapted TorchTPU baselines against Table 1 of Jeong et al. (*"Leveraging Pathology Co-occurrence for Test-Time Adaptation in Chest X-Ray Diagnosis"*, MICCAI 2026, [Paper 4786](https://papers.miccai.org/miccai-2026/paper/4786_paper.pdf)), which evaluates the same TorchXRayVision DenseNet-121 checkpoints (`densenet121-res224-chex`, `densenet121-res224-nih`) across the same 6 pathologies:
+
+1. **Exact Pipeline Alignment on `CheXpert → NIH` (`test_list.txt`):**
+   - Our `CheXpert → NIH` AUROC (`0.5659 / 0.6229 / 0.6731 / 0.6744 / 0.6413 / 0.6968`, macro **0.6457**) matches the MICCAI 2026 `No Adapt.` baseline (`56.6 / 62.3 / 67.4 / 67.4 / 64.1 / 69.7`, macro **64.6**) to within `0.0009` per class, confirming our `normalize(maxval=255)` + `XRayResizer(224)` preprocessing and raw-logit evaluation match the literature protocol.
+   - Notably, our unadapted `PadChest → NIH` run (**0.7126** macro AUROC) outperforms both the paper's unadapted `CheXpert → NIH` (**64.6**) and its CoWA test-time adaptation (**66.8**)—PadChest was not evaluated as a source domain in Jeong et al.
+2. **Cohort Difference on `CheXpert → MIMIC-CXR`:**
+   - Our `CheXpert → MIMIC-CXR` run achieves **0.7138** macro AUROC vs. **66.7** (`No Adapt.`) and **68.4** (`CoWA`) in MICCAI 2026. This +0.047 difference reflects **target cohort and label differences**: MICCAI 2026 evaluated on the official PhysioNet `MIMIC-CXR-JPG` unseen test split with CheXpert-labeler targets, whereas our run evaluated on the 1,419 **frontal-only (`AP`/`PA`)** validation images from the Kaggle `simhadrisadaram/mimic-cxr-dataset` subset with regex-parsed report labels.
+
+---
+
 ## Experimental Setup, Data, and Normalization
 
 | Dataset | Cohort & Label Extraction | Image Format & XRV Normalization |
