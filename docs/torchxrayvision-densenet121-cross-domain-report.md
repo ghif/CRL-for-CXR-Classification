@@ -2,12 +2,13 @@
 
 ## Abstract
 
-We present a systematic cross-domain evaluation of four pretrained TorchXRayVision DenseNet-121 classifiers—trained on **CheXpert**, **PadChest**, **MIMIC-CXR**, and **NIH ChestX-ray14**—across **six target cohorts** (**CheXpert**, **PadChest**, **CXR-RAIT**, **MIMIC-CXR**, **X-Raydar**, and **NIH ChestX-ray14**, totaling **63,791** test radiographs) on **TorchTPU**. Across all **24 source–target pairs** (20 cross-domain and 4 in-domain reference baselines), we evaluate both **unadapted zero-shot transfer (`No Adapt.`)** and **Co-occurrence Weighted Adaptation (`CoWA`)**, a source-free test-time adaptation (TTA) method proposed at MICCAI 2026.
+We present a systematic cross-domain evaluation of four pretrained TorchXRayVision DenseNet-121 classifiers—trained on **CheXpert**, **PadChest**, **MIMIC-CXR**, and **NIH ChestX-ray14**—across **six target cohorts** (**CheXpert**, **PadChest**, **CXR-RAIT**, **MIMIC-CXR**, **X-Raydar**, and **NIH ChestX-ray14**, totaling **63,791** test radiographs) on **TorchTPU**. Across all **24 source–target pairs** (20 cross-domain and 4 in-domain reference baselines), we benchmark **unadapted zero-shot transfer (`No Adapt.`)** against **six source-free test-time adaptation (TTA) algorithms**: **AdaBN**, **TENT**, **CoTTA**, **EATA**, **RoTTA**, and **CoWA**.
 
-Our experiments reveal three main findings:
+Our experiments reveal four main findings:
 1. **PadChest generalizes best across external domains:** Without adaptation, `densenet121-res224-pc` achieves the highest cross-domain macro AUROC on **NIH ChestX-ray14** (`0.7126`, exceeding even the in-domain NIH model at `0.7025`), **X-Raydar** (`0.7527`), and **CXR-RAIT** (`0.7000`).
-2. **Exact alignment with published benchmarks:** On the official NIH `test_list.txt` split, our `CheXpert → NIH` unadapted baseline (`0.6457` macro AUROC) matches Table 1 of Jeong et al. (MICCAI 2026, `64.6`) to within `0.0003`.
-3. **CoWA TTA sensitivity to stream length and logit calibration:** With fixed paper-default hyperparameters (`lr = 1e-3`, `w_min = 0.01`) and uncalibrated `sigmoid(raw_logits)` (required to avoid `aten.index_put` on TorchTPU), CoWA improves short-stream transfer on `CheXpert → X-Raydar` (`0.6727 → 0.6921`, `+0.0193` over 16 batches) but degrades performance on long target streams (`174–400` batches on PadChest, CheXpert, and NIH) due to cumulative BatchNorm affine drift.
+2. **Exact alignment with published benchmarks:** On the official NIH `test_list.txt` split, our `CheXpert → NIH` unadapted (`0.6457`) and AdaBN (`0.6685`) baselines match Table 1 of Jeong et al. (MICCAI 2026: `64.6` and `67.0`) to within `0.0015`.
+3. **Stability vs. collapse across TTA families:** Across the 20 cross-domain pairs, **No Adapt.** (`0.6941 ± 0.0445`), **CoTTA** (`0.6921 ± 0.0454`), **AdaBN** (`0.6914 ± 0.0460`), and **RoTTA** (`0.6904 ± 0.0464`) remain stable, with **AdaBN** winning the most individual pairs (**9 of 24**, e.g., `chexpert → nih` `+0.0227`, `nih → cxr_rait` `+0.0222`). In contrast, pure or weakly regularized entropy-minimization methods (**TENT** `0.6308`, **EATA** `0.6350`, **CoWA** `0.6266`) improve short-stream transfer (`chexpert → xraydar`, 16 batches: `+0.0178` to `+0.0201`) but collapse on long streams (`174–400` batches) at fixed `lr = 1e-3` without `op_threshs` calibration.
+4. **Runtime–accuracy trade-off:** Offline TTA adds **~3× to ~29×** wall-clock overhead over compiled `No Adapt.` inference, with **EATA** being the slowest (~6× slower than TENT) due to its two-pass Fisher estimation.
 
 ---
 
@@ -24,63 +25,113 @@ All source models are `torchxrayvision==1.5.7` DenseNet-121 backbones (`op_thres
 | `mimic_ch` | `densenet121-res224-mimic_ch` | `23b13a04459684ffa41247d068207a7657b4e1b4dec2b02431f5026bd75b1189` |
 | `nih` | `densenet121-res224-nih` | `31a5475c6b1383a7edbfcaf96af9ce302eb9969cfe28b6b8b5859afc6f274fdf` |
 
-We evaluate **6 shared thoracic pathologies**: `Atelectasis`, `Cardiomegaly`, `Pleural Effusion` (`Effusion` head), `Consolidation`, `Pneumothorax`, and `Edema`. On **CXR-RAIT** and **X-Raydar**, `Edema` is omitted because no direct `edema` label exists in their annotation schemas; we therefore report both **5-pathology** (common to all 6 targets) and **6-pathology** macro averages.
+We evaluate **6 shared thoracic pathologies**: `Atelectasis`, `Cardiomegaly`, `Pleural Effusion` (`Effusion` head), `Consolidation`, `Pneumothorax`, and `Edema`. On **CXR-RAIT** and **X-Raydar**, `Edema` is omitted because no direct `edema` label exists in their annotation schemas; we therefore report both **5-pathology** (common to all 6 targets) and **all-available-pathology** macro averages.
 
 ### 1.2 Target Cohorts and Preprocessing
 
-| Target Cohort | N | Label Source & Binarization | Image Format & Normalization |
-| --- | ---: | --- | --- |
-| **CheXpert** | 21,438 | `chexpert.sample.test.csv` joined with HF `danjacobellis/chexpert` Parquet shards; U-Zeroes (`code == 3` → `1`) | 224×224 `uint8` PNG, `normalize(maxval=255)` |
-| **PadChest** | 11,111 | `padchest-stage-manifest.jsonl` (`split == "test"`, frontal `PA`/`AP`/`AP_horizontal`) + `PADCHEST_..._160K_01.02.19.csv` | 224×224 **`uint16`** PNG, `normalize(maxval=65535)` |
-| **CXR-RAIT** | 3,248 | `labels_5pathologies.csv` (`prediction_nlp >= 0.5` from `all_years_rekonsiliasi_final.csv`); 5 pathologies | 224×224 `uint8` PNG, `normalize(maxval=255)` |
-| **MIMIC-CXR** | 1,419 | Frontal `AP`/`PA` from Kaggle `simhadrisadaram/mimic-cxr-dataset` (`mimic_cxr_aug_validate.csv`), negation-aware regex over `text` | 512×512 RGB JPEG → grayscale, `normalize(255)`, `XRayResizer(224)` |
-| **X-Raydar** | 979 | `annotations.jsonl` radiologist-adjudicated `consensus_labels`; 5 pathologies | Full-res `uint8` PNG → `normalize(255)`, `XRayResizer(224)` |
-| **NIH ChestX-ray14** | 25,596 | Official `test_list.txt` + `Data_Entry_2017.csv` from Kaggle `nih-chest-xrays/data`, pipe-delimited `Finding Labels` | 1024×1024 `uint8` PNG → `normalize(255)`, `XRayResizer(224)` |
+| Target Cohort | N | Batches (`B=64`) | Label Source & Binarization | Image Format & Normalization |
+| --- | ---: | ---: | --- | --- |
+| **CheXpert** | 21,438 | 335 | `chexpert.sample.test.csv` joined with HF `danjacobellis/chexpert` Parquet shards; U-Zeroes (`code == 3` → `1`) | 224×224 `uint8` PNG, `normalize(maxval=255)` |
+| **PadChest** | 11,111 | 174 | `padchest-stage-manifest.jsonl` (`split == "test"`, frontal `PA`/`AP`/`AP_horizontal`) + `PADCHEST_..._160K_01.02.19.csv` | 224×224 **`uint16`** PNG, `normalize(maxval=65535)` |
+| **CXR-RAIT** | 3,248 | 51 | `labels_5pathologies.csv` (`prediction_nlp >= 0.5` from `all_years_rekonsiliasi_final.csv`); 5 pathologies | 224×224 `uint8` PNG, `normalize(maxval=255)` |
+| **MIMIC-CXR** | 1,419 | 23 | Frontal `AP`/`PA` from Kaggle `simhadrisadaram/mimic-cxr-dataset` (`mimic_cxr_aug_validate.csv`), negation-aware regex over `text` | 512×512 RGB JPEG → grayscale, `normalize(255)`, `XRayResizer(224)` |
+| **X-Raydar** | 979 | 16 | `annotations.jsonl` radiologist-adjudicated `consensus_labels`; 5 pathologies | Full-res `uint8` PNG → `normalize(255)`, `XRayResizer(224)` |
+| **NIH ChestX-ray14** | 25,596 | 400 | Official `test_list.txt` + `Data_Entry_2017.csv` from Kaggle `nih-chest-xrays/data`, pipe-delimited `Finding Labels` | 1024×1024 `uint8` PNG → `normalize(255)`, `XRayResizer(224)` |
 
-### 1.3 Hardware, Environment, and CoWA Protocol
+### 1.3 Hardware, Environment, and TTA Protocols
 
-All runs executed on **TorchTPU** (`/mnt/data/miniconda/envs/crl-cxr`, Python 3.13, `torch-tpu==0.2.0`, `bfloat16` autocast, batch size 64).
-- **Unadapted (`No Adapt.`):** Raw logits evaluated in `eval()` mode; compiled runs (`torch.compile(backend="tpu", dynamic=False)`) achieved up to **2,871 img/s** on pre-resized 224×224 cohorts.
-- **CoWA TTA (`CoWA`):** Ported from [`woojin716/CoWA`](https://github.com/woojin716/CoWA) to TorchTPU (`evaluate_cowa_cross_domain.py`). Because TorchTPU cannot trace `op_threshs` (`aten.index_put`), probabilities for entropy and co-occurrence estimation are computed via `torch.sigmoid(raw_logits)`. Only BatchNorm affine parameters (`weight`, `bias`) are updated using Adam (`lr = 1e-3`, `steps = 1`, `cooccur_threshold = 0.5`, `pattern_temp = 0.1`, `min_weight = 0.01`, `seed = 42`), with a `train()`-mode BatchNorm EMA hook (`install_tpu_batchnorm_stats_fix`) so Pass 2 evaluation uses updated running statistics.
+All runs executed on **TorchTPU** (`/mnt/data/miniconda/envs/crl-cxr`, Python 3.13, `torch-tpu==0.2.0`, `bfloat16` autocast, `batch_size = 64`, `seed = 42`). Because TorchTPU cannot trace `op_threshs` (`aten.index_put`), probabilities during adaptation are computed via `torch.sigmoid(raw_logits)`. All gradient-based methods adapt only BatchNorm affine parameters (`weight`, `bias`) using Adam (`lr = 1e-3`, `steps = 1`), with `install_tpu_batchnorm_stats_fix` attached so `train()`-mode BatchNorm EMA updates are preserved:
 
----
-
-## 2. Main Results: Unadapted (`No Adapt.`) vs. CoWA TTA
-
-Table 1 reports the complete 4×6 evaluation matrix across all **24 pairs** (macro AUROC and macro AUPRC over all available pathologies per target, plus the 5-pathology common macro AUROC).
-
-| Source → Target | Regime | N | 5-Path AUROC (`No Adapt.` → `CoWA`) | All-Path AUROC (`No Adapt.` → `CoWA`) | Δ AUROC | All-Path AUPRC (`No Adapt.` → `CoWA`) |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| `chexpert → chexpert` | In-domain | 21,438 | 0.7121 → 0.6228 | 0.7173 → 0.6314 | −0.0859 | 0.3736 → 0.3281 |
-| `padchest → chexpert` | Cross-domain | 21,438 | **0.6792** → 0.5503 | **0.6858** → 0.5641 | −0.1217 | **0.3673** → 0.2926 |
-| `mimic_ch → chexpert` | Cross-domain | 21,438 | 0.6534 → 0.5406 | 0.6665 → 0.5586 | −0.1079 | 0.3378 → 0.2889 |
-| `nih → chexpert` | Cross-domain | 21,438 | 0.6458 → 0.5526 | 0.6503 → 0.5533 | −0.0970 | 0.3369 → 0.2826 |
-| `chexpert → padchest` | Cross-domain | 11,111 | 0.7487 → 0.6091 | 0.7747 → 0.6024 | −0.1723 | 0.1387 → 0.0856 |
-| `padchest → padchest` | In-domain | 11,111 | 0.8486 → 0.6662 | 0.8636 → 0.6636 | −0.2000 | 0.2433 → 0.1081 |
-| `mimic_ch → padchest` | Cross-domain | 11,111 | 0.7536 → 0.5680 | 0.7738 → 0.5893 | −0.1845 | 0.1488 → 0.0646 |
-| `nih → padchest` | Cross-domain | 11,111 | **0.7639** → 0.5778 | **0.7832** → 0.5929 | −0.1904 | **0.1788** → 0.0821 |
-| `chexpert → cxr_rait` | Cross-domain | 3,248 | 0.6806 → 0.6718 | 0.6806 → 0.6718 | −0.0089 | 0.3226 → 0.3197 |
-| `padchest → cxr_rait` | Cross-domain | 3,248 | **0.7000** → 0.6473 | **0.7000** → 0.6473 | −0.0527 | **0.3859** → 0.3346 |
-| `mimic_ch → cxr_rait` | Cross-domain | 3,248 | 0.6459 → 0.5834 | 0.6459 → 0.5834 | −0.0624 | 0.2865 → 0.2403 |
-| `nih → cxr_rait` | Cross-domain | 3,248 | 0.6613 → 0.6282 | 0.6613 → 0.6282 | −0.0331 | 0.3234 → 0.3129 |
-| `chexpert → mimic_cxr` | Cross-domain | 1,419 | **0.7017** → 0.6933 | **0.7138** → 0.7030 | −0.0108 | 0.3185 → 0.3131 |
-| `padchest → mimic_cxr` | Cross-domain | 1,419 | 0.6997 → 0.6866 | 0.7111 → 0.6975 | −0.0135 | **0.3361** → 0.3254 |
-| `mimic_ch → mimic_cxr` | In-domain | 1,419 | 0.7012 → 0.6452 | 0.7122 → 0.6580 | −0.0542 | 0.3117 → 0.2782 |
-| `nih → mimic_cxr` | Cross-domain | 1,419 | 0.6668 → 0.6360 | 0.6762 → 0.6461 | −0.0301 | 0.2996 → 0.2885 |
-| `chexpert → xraydar` | Cross-domain | 979 | 0.6727 → **0.6921** | 0.6727 → **0.6921** | **+0.0193** | 0.5328 → **0.5461** |
-| `padchest → xraydar` | Cross-domain | 979 | **0.7527** → 0.7345 | **0.7527** → 0.7345 | −0.0182 | 0.5845 → **0.5870** |
-| `mimic_ch → xraydar` | Cross-domain | 979 | 0.6592 → 0.6396 | 0.6592 → 0.6396 | −0.0196 | 0.5142 → 0.4960 |
-| `nih → xraydar` | Cross-domain | 979 | 0.6815 → 0.6653 | 0.6815 → 0.6653 | −0.0162 | 0.5499 → 0.5450 |
-| `chexpert → nih` | Cross-domain | 25,596 | 0.6355 → 0.6153 | 0.6457 → 0.6248 | −0.0210 | 0.1389 → 0.1407 |
-| `padchest → nih` | Cross-domain | 25,596 | **0.7064** → 0.6011 | **0.7126** → 0.5980 | −0.1147 | **0.1866** → 0.1251 |
-| `mimic_ch → nih` | Cross-domain | 25,596 | 0.6262 → 0.5195 | 0.6346 → 0.5404 | −0.0942 | 0.1425 → 0.1043 |
-| `nih → nih` | In-domain | 25,596 | 0.6960 → 0.5725 | 0.7025 → 0.5626 | −0.1399 | 0.1913 → 0.1163 |
+- **AdaBN** (Li et al., ICLR-W 2017): Resets BN running stats (`momentum = None`) and accumulates cumulative target-domain mean/variance in `train()` mode (`no_grad`).
+- **TENT** (Wang et al., ICLR 2021): Minimizes unweighted binary entropy $H(\hat{y})$.
+- **CoTTA** (Wang et al., CVPR 2022): Student entropy minimization + teacher EMA (`0.999`) + stochastic restoration (`0.01`).
+- **EATA** (Niu et al., ICML 2022): Two-pass adaptation—Pass 0 estimates diagonal Fisher information; Pass 1 minimizes entropy on low-entropy samples (`ent / log 2 < 0.4`) with Fisher regularization (`alpha = 50.0`).
+- **RoTTA** (Yuan et al., CVPR 2023): Memory bank (`size = 64`, sample `16`) + robust BN EMA (`nu = 0.001`) + teacher–student cross-entropy (`ema = 0.999`).
+- **CoWA** (Jeong et al., MICCAI 2026): Accumulates target pathology co-occurrence matrix (`threshold = 0.5`) and weights per-sample entropy by Frobenius consistency (`tau = 0.1`, `min_weight = 0.01`).
 
 ---
 
-## 3. Per-Pathology Breakdown (`No Adapt.` Baseline)
+## 2. Main Results: Unadapted vs. Six TTA Methods (All 24 Pairs)
 
-### 3.1 Per-Pathology AUROC
+Table 1 reports **Macro AUROC** across all available pathologies per target (6 pathologies on CheXpert, PadChest, MIMIC-CXR, NIH; 5 pathologies on CXR-RAIT, X-Raydar). **Bold** marks the best method per row.
+
+| Source → Target | Regime | N | `No Adapt.` | `AdaBN` | `TENT` | `CoTTA` | `EATA` | `RoTTA` | `CoWA` |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `chexpert → chexpert` | In-domain | 21,438 | **0.7173** | 0.7106 | 0.6443 | 0.7131 | 0.5793 | 0.7160 | 0.6314 |
+| `padchest → chexpert` | Cross-domain | 21,438 | 0.6858 | **0.6940** | 0.5721 | 0.6779 | 0.5798 | 0.6705 | 0.5641 |
+| `mimic_ch → chexpert` | Cross-domain | 21,438 | **0.6665** | 0.6442 | 0.5483 | 0.6614 | 0.5413 | 0.6548 | 0.5586 |
+| `nih → chexpert` | Cross-domain | 21,438 | 0.6503 | **0.6674** | 0.5518 | 0.6426 | 0.5636 | 0.6346 | 0.5533 |
+| `chexpert → padchest` | Cross-domain | 11,111 | 0.7747 | 0.7732 | 0.7551 | **0.7754** | 0.7702 | 0.7746 | 0.6024 |
+| `padchest → padchest` | In-domain | 11,111 | 0.8636 | **0.8644** | 0.6662 | 0.8612 | 0.6788 | 0.8632 | 0.6636 |
+| `mimic_ch → padchest` | Cross-domain | 11,111 | 0.7738 | **0.7778** | 0.5660 | 0.7728 | 0.5756 | 0.7697 | 0.5893 |
+| `nih → padchest` | Cross-domain | 11,111 | 0.7832 | **0.7840** | 0.5959 | 0.7793 | 0.6037 | 0.7820 | 0.5929 |
+| `chexpert → cxr_rait` | Cross-domain | 3,248 | 0.6806 | 0.6644 | 0.6668 | **0.6807** | 0.6623 | 0.6803 | 0.6718 |
+| `padchest → cxr_rait` | Cross-domain | 3,248 | 0.7000 | **0.7037** | 0.6477 | 0.6995 | 0.6484 | 0.6999 | 0.6473 |
+| `mimic_ch → cxr_rait` | Cross-domain | 3,248 | **0.6459** | 0.6181 | 0.5946 | 0.6457 | 0.6123 | 0.6455 | 0.5834 |
+| `nih → cxr_rait` | Cross-domain | 3,248 | 0.6613 | **0.6835** | 0.6283 | 0.6603 | 0.6316 | 0.6598 | 0.6282 |
+| `chexpert → mimic_cxr` | Cross-domain | 1,419 | **0.7138** | 0.7104 | 0.7125 | **0.7138** | 0.7092 | **0.7138** | 0.7030 |
+| `padchest → mimic_cxr` | Cross-domain | 1,419 | 0.7111 | 0.7045 | 0.6975 | 0.7111 | 0.6949 | **0.7112** | 0.6975 |
+| `mimic_ch → mimic_cxr` | In-domain | 1,419 | **0.7122** | 0.6894 | 0.6581 | **0.7122** | 0.6709 | **0.7122** | 0.6580 |
+| `nih → mimic_cxr` | Cross-domain | 1,419 | 0.6762 | **0.6798** | 0.6465 | 0.6759 | 0.6488 | 0.6763 | 0.6461 |
+| `chexpert → xraydar` | Cross-domain | 979 | 0.6727 | 0.6853 | **0.6928** | 0.6728 | 0.6905 | 0.6727 | 0.6921 |
+| `padchest → xraydar` | Cross-domain | 979 | 0.7527 | 0.7328 | 0.7349 | **0.7528** | 0.7310 | **0.7528** | 0.7345 |
+| `mimic_ch → xraydar` | Cross-domain | 979 | **0.6592** | 0.6334 | 0.6437 | **0.6592** | 0.6453 | 0.6590 | 0.6396 |
+| `nih → xraydar` | Cross-domain | 979 | 0.6815 | **0.6846** | 0.6653 | 0.6812 | 0.6625 | 0.6815 | 0.6653 |
+| `chexpert → nih` | Cross-domain | 25,596 | 0.6457 | **0.6685** | 0.5610 | 0.6402 | 0.5911 | 0.6417 | 0.6248 |
+| `padchest → nih` | Cross-domain | 25,596 | **0.7126** | 0.6914 | 0.5971 | 0.7095 | 0.6024 | 0.7036 | 0.5980 |
+| `mimic_ch → nih` | Cross-domain | 25,596 | **0.6346** | 0.6277 | 0.5372 | 0.6291 | 0.5362 | 0.6247 | 0.5404 |
+| `nih → nih` | In-domain | 25,596 | **0.7025** | 0.6987 | 0.5626 | 0.6899 | 0.5749 | 0.6842 | 0.5626 |
+
+### Aggregate Summary Across the 20 Cross-Domain Pairs
+
+| Method | Mean AUROC | Std | Min | Max | Pairs Won (of 24) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `No Adapt.` | **0.6941** | 0.0445 | 0.6346 | 0.7832 | 9 |
+| `CoTTA` | 0.6921 | 0.0454 | 0.6291 | 0.7793 | 4 |
+| `AdaBN` | 0.6914 | 0.0460 | 0.6181 | **0.7840** | **10** |
+| `RoTTA` | 0.6904 | 0.0464 | 0.6247 | 0.7820 | 4 |
+| `EATA` | 0.6350 | 0.0618 | 0.5362 | 0.7702 | 0 |
+| `TENT` | 0.6308 | 0.0642 | 0.5372 | 0.7551 | 1 |
+| `CoWA` | 0.6266 | 0.0541 | 0.5404 | 0.7345 | 0 |
+
+---
+
+## 3. Runtime and Computational Complexity
+
+### 3.1 Asymptotic Complexity
+
+Let $N$ be the target cohort size, $B$ the batch size, $T = \lceil N/B \rceil$ the number of batches, $L$ the number of BatchNorm layers ($L = 121$ in DenseNet-121), $P_{\text{BN}}$ the trainable BN affine parameters, $C$ the number of pathologies, and $C_{\text{fwd}}, C_{\text{bwd}}$ the cost of one forward and backward pass per batch:
+
+| Method | Passes over Target Data | Complexity per Cohort | Gradient Updates? |
+| --- | --- | --- | :---: |
+| `No Adapt.` | 1 (`eval`) | $O(T \cdot C_{\text{fwd}})$ | No |
+| `AdaBN` | 2 (1 `train` no-grad + 1 `eval`) | $O(2 T \cdot C_{\text{fwd}} + T \cdot L)$ | No |
+| `TENT` | 2 (1 `train` fwd/bwd + 1 `eval`) | $O(T(C_{\text{fwd}} + C_{\text{bwd}}) + T \cdot C_{\text{fwd}})$ | Yes |
+| `CoTTA` | 2 (1 `train` fwd/bwd + 1 `eval`) | $O(T(C_{\text{fwd}} + C_{\text{bwd}} + P) + T \cdot C_{\text{fwd}})$ | Yes |
+| `RoTTA` | 2 (1 memory-bank teacher+student + 1 `eval`) | $O(T(C_{\text{fwd}}^{\text{mem}} + C_{\text{bwd}}^{\text{mem}} + P + L) + T \cdot C_{\text{fwd}})$ | Yes |
+| `CoWA` | 2 (dual `eval`+`train` in Pass 1 + 1 `eval`) | $O(T(2 C_{\text{fwd}} + C_{\text{bwd}} + B C^2) + T \cdot C_{\text{fwd}})$ | Yes |
+| `EATA` | **3** (1 Fisher fwd/bwd + 1 adapt fwd/bwd + 1 `eval`) | $O(2 T(C_{\text{fwd}} + C_{\text{bwd}} + P_{\text{BN}}) + T \cdot C_{\text{fwd}})$ | Yes |
+
+### 3.2 Observed Median Wall-Clock Adaptation Time (TorchTPU, `batch_size = 64`)
+
+Table 2 reports the **median adaptation-only wall-clock time** (in seconds, excluding Pass 2 evaluation and initial XLA compilation outliers) across the 4 source models for each target cohort, alongside compiled `No Adapt.` inference time where measured:
+
+| Target Cohort | N | `No Adapt.` *(compiled)* | `TENT` | `CoTTA` | `RoTTA` | `AdaBN` | `CoWA` | `EATA` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **X-Raydar** | 979 | — | 1.41s | 1.72s | 2.14s | 3.37s | 3.76s | 11.38s |
+| **MIMIC-CXR** | 1,419 | 3.80s | 2.02s | 2.38s | 2.85s | 4.80s | 5.23s | 15.88s |
+| **CXR-RAIT** | 3,248 | 1.14s | 4.62s | 5.45s | 6.57s | 10.56s | 11.93s | 33.32s |
+| **PadChest** | 11,111 | 5.03s | 15.58s | 18.25s | 21.51s | 36.27s | 40.57s | 101.35s |
+| **CheXpert** | 21,438 | 7.47s | 28.91s | 32.54s | 42.95s | 73.48s | 74.80s | 191.13s |
+| **NIH** | 25,596 | — | 37.06s | 43.11s | 48.85s | 86.12s | 93.38s | 230.58s |
+
+Runtime scales linearly with $N$. In eager TorchTPU, **TENT** is the fastest TTA method (~3–4× slower than compiled `No Adapt.`), **CoTTA** and **RoTTA** add ~15–45% overhead for teacher EMA / memory sampling, **AdaBN** and **CoWA** take ~2.4–2.6× TENT (Python BN-EMA pre-hook over 121 layers / dual forward passes), and **EATA** is ~6.2× slower than TENT due to its full-dataset Fisher estimation pass.
+
+---
+
+## 4. Per-Pathology Breakdown (`No Adapt.` Baseline) and Cohort Prevalence
+
+### 4.1 Per-Pathology AUROC (`No Adapt.`)
 
 | Pathology | CheX → PadChest | PadChest → CheX | CheX → RAIT | PadChest → RAIT | CheX → MIMIC | PadChest → MIMIC | CheX → X-Raydar | PadChest → X-Raydar | MIMIC → X-Raydar | CheX → NIH | PadChest → NIH | MIMIC → NIH | CheX → CheX (ref) | PadChest → PadChest (ref) | MIMIC → MIMIC (ref) | NIH → NIH (ref) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -91,7 +142,7 @@ Table 1 reports the complete 4×6 evaluation matrix across all **24 pairs** (mac
 | Pneumothorax | 0.5910 | 0.6215 | 0.6850 | 0.6154 | 0.6140 | 0.6074 | 0.6550 | 0.7831 | 0.6705 | 0.6413 | 0.6751 | 0.6067 | 0.7338 | 0.7703 | 0.6342 | 0.5999 |
 | Edema | 0.9046 | 0.7184 | — | — | 0.7743 | 0.7679 | — | — | — | 0.6968 | 0.7440 | 0.6767 | 0.7429 | 0.9383 | 0.7668 | 0.7352 |
 
-### 3.2 Target Cohort Positive Prevalence
+### 4.2 Target Cohort Positive Prevalence
 
 | Pathology | PadChest (`N = 11,111`) | CheXpert (`N = 21,438`) | CXR-RAIT (`N = 3,248`) | MIMIC-CXR (`N = 1,419`) | X-Raydar (`N = 979`) | NIH (`N = 25,596`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -106,24 +157,19 @@ On PadChest (`N = 11,111`), both `CheXpert → PadChest` (`0.7919` vs. `0.7734`)
 
 ---
 
-## 4. Analysis and Discussion
+## 5. Discussion and Comparison with Literature
 
-### 4.1 Comparison with Published Literature (MICCAI 2026 CoWA)
-
-Comparing our results against Table 1 of Jeong et al. (*"Leveraging Pathology Co-occurrence for Test-Time Adaptation in Chest X-Ray Diagnosis"*, MICCAI 2026, [Paper 4786](https://papers.miccai.org/miccai-2026/paper/4786_paper.pdf)):
-- **Exact baseline parity on `CheXpert → NIH` (`test_list.txt`):** Our unadapted `CheXpert → NIH` AUROC (`0.5659 / 0.6229 / 0.6731 / 0.6744 / 0.6413 / 0.6968`, macro **0.6457**) matches the paper's `No Adapt.` baseline (`56.6 / 62.3 / 67.4 / 67.4 / 64.1 / 69.7`, macro **64.6**) to within `0.0009` per pathology, validating our image preprocessing and raw-logit scoring.
-- **Unadapted PadChest surpasses adapted CheXpert on NIH:** Jeong et al. only evaluated CheXpert and NIH as sources. Our unadapted `PadChest → NIH` model (**0.7126** macro AUROC) outperforms both unadapted `CheXpert → NIH` (`64.6`) and CoWA-adapted `CheXpert → NIH` (`66.8`), as well as the in-domain NIH model (`0.7025`).
-- **Cohort differences on `CheXpert → MIMIC-CXR`:** Our `CheXpert → MIMIC-CXR` baseline achieves **0.7138** macro AUROC vs. **66.7** in MICCAI 2026 because our cohort uses the 1,419 **frontal-only (`AP`/`PA`)** validation images from Kaggle `simhadrisadaram/mimic-cxr-dataset` with regex-parsed labels, whereas MICCAI 2026 used the official PhysioNet `MIMIC-CXR-JPG` unseen test split.
-
-### 4.2 Why CoWA Degrades on Long Uncalibrated Streams
-
-Our CoWA TTA sweep reveals a clear relationship between target stream length (`N / 64` batches) and adaptation stability when using a fixed learning rate (`lr = 1e-3`) without XRV's `op_threshs` calibration:
-- **Short streams (`16–51` batches):** On `CheXpert → X-Raydar` (`N = 979`, 16 batches), CoWA improves macro AUROC (`0.6727 → 0.6921`, **+0.0193**) and macro AUPRC (`0.5328 → 0.5461`). On `PadChest → X-Raydar`, macro AUPRC ticks up slightly (`0.5845 → 0.5870`) while AUROC dips (`−0.0182`).
-- **Long streams (`174–400` batches):** On PadChest (174 batches), CheXpert (335 batches), and NIH (400 batches), running `lr = 1e-3` continuously without per-pair learning-rate tuning (`[1e-4, 1e-2]` in Jeong et al., whose `configs/tta_ours_configs_final.json` is omitted from GitHub) or XRV's operating-point calibration (`op_threshs`) causes cumulative entropy-minimization drift (`−0.086` to `−0.200` macro AUROC). Tuning smaller learning rates (e.g. `1e-4`) or resetting/bounding BN updates is therefore essential when deploying CoWA on large target cohorts.
+1. **Alignment with MICCAI 2026 (Jeong et al., [Paper 4786](https://papers.miccai.org/miccai-2026/paper/4786_paper.pdf)):**
+   - On `CheXpert → NIH` (`test_list.txt`), our `No Adapt.` (`0.6457`) and `AdaBN` (`0.6685`) macro AUROCs closely match Jeong et al.'s Table 1 (`64.6` and `67.0`).
+   - On `CheXpert → MIMIC-CXR`, our `No Adapt.` (`0.7138` vs. `66.7`) reflects our frontal-only Kaggle validation cohort (`N = 1,419`) vs. the official PhysioNet `MIMIC-CXR-JPG` test split.
+2. **Why `AdaBN`, `CoTTA`, and `RoTTA` outperform unconstrained entropy minimization (`TENT`, `EATA`, `CoWA`):**
+   - Gradient-free `AdaBN` recalibrates feature normalization without risking parameter collapse, improving 10 of 24 pairs (including `+0.0227` on `chexpert → nih` and `+0.0222` on `nih → cxr_rait`).
+   - `CoTTA` and `RoTTA` preserve stability via slow teacher EMA (`0.999`) and stochastic restoration / memory replay.
+   - `TENT`, `EATA`, and `CoWA` with fixed `lr = 1e-3` and uncalibrated `sigmoid(raw_logits)` improve short-stream adaptation (`chexpert → xraydar`, 16 batches: `+0.0178` to `+0.0201`), but accumulate drift over 174–400 batches on PadChest, CheXpert, and NIH. Per-pair learning-rate tuning (`[1e-4, 1e-2]`) and operating-point calibration are therefore critical for gradient-based TTA on large cohorts.
 
 ---
 
-## 5. Reproducibility and Artifacts
+## 6. Reproducibility and Artifacts
 
 All scripts run in `/mnt/data/miniconda/envs/crl-cxr` on TorchTPU:
 
@@ -135,14 +181,13 @@ All scripts run in `/mnt/data/miniconda/envs/crl-cxr` on TorchTPU:
 /mnt/data/miniconda/envs/crl-cxr/bin/python scripts/evaluate_torchxrayvision_xraydar.py --device tpu --compile-model --batch-size 64
 /mnt/data/miniconda/envs/crl-cxr/bin/python scripts/evaluate_torchxrayvision_nih.py --device tpu --compile-model --batch-size 64 --num-workers 8
 
-# Full 24-pair CoWA TTA vs. No Adapt. sweep
+# 24-pair TTA sweeps (CoWA, AdaBN, and TENT/CoTTA/EATA/RoTTA)
 /mnt/data/miniconda/envs/crl-cxr/bin/python scripts/evaluate_cowa_cross_domain.py --device tpu --batch-size 64
+/mnt/data/miniconda/envs/crl-cxr/bin/python scripts/evaluate_adabn_cross_domain.py --device tpu --batch-size 64
+/mnt/data/miniconda/envs/crl-cxr/bin/python scripts/evaluate_tta_baselines_cross_domain.py --device tpu --batch-size 64
 ```
 
-Machine-readable outputs (`summary.json`, `comparison.csv`, and per-pair predictions) are stored under `chexpert/runs/`:
-- `chexpert/runs/xrv_densenet121_chexpert_padchest/`
-- `chexpert/runs/xrv_densenet121_cxr_rait_5pathologies/`
-- `chexpert/runs/xrv_densenet121_mimic_cxr/`
-- `chexpert/runs/xrv_densenet121_xraydar/`
-- `chexpert/runs/xrv_densenet121_nih/`
+Outputs (`summary.json`, `comparison.csv`) are stored under `chexpert/runs/`:
 - `chexpert/runs/cowa_densenet121_cross_domain/`
+- `chexpert/runs/adabn_densenet121_cross_domain/`
+- `chexpert/runs/tta_baselines_densenet121_cross_domain/`
